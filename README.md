@@ -1,15 +1,6 @@
 # RAG Chatbot
 
-An intelligent Q&A system based on DeepSeek-R1 documentation, built with LangChain, LangGraph, Groq, Pinecone, and open-source embeddings.
-
-## Key Features
-
-- Document processing: automatic PDF loading and chunking (fixed and semantic)
-- Hybrid retrieval: BM25 keyword search + vector search
-- Reranking: BGE reranker for more relevant results
-- LangGraph orchestration: Agentic RAG workflow with routing and refinement
-- Multi-turn conversation: per-session history (last 3 turns) considered in generation
-- Web interface: simple Flask + HTML/CSS frontend
+An intelligent Q&A system based on DeepSeek-R1 documentation.
 
 ## Architecture Overview
 
@@ -34,26 +25,13 @@ An intelligent Q&A system based on DeepSeek-R1 documentation, built with LangCha
     - general → END
   - Evaluation nodes use a deterministic judge LLM for faithfulness/relevance and embeddings for context recall
 
-## Project Structure
-
-```
-RAG/
-├── rag_system.py          # Core RAG system (Agentic LangGraph pipeline inside)
-├── app.py                 # Flask backend (REST API + HTML template)
-├── templates/
-│   └── index.html         # Frontend chat UI
-├── requirements.txt       # Python dependencies
-├── Deepseek-r1.pdf        # Source document (place in project root)
-└── .env                   # Environment variables (create this)
-```
-
 ## Requirements
 
 - Python 3.10+
 - Dependencies (see requirements.txt):
   - langchain, langchain-community, langchain-groq, langgraph, langchain-text-splitters
   - sentence-transformers, transformers, accelerate, torch
-  - pinecone-client, pinecone-text, faiss-cpu (optional)
+  - pinecone-client, pinecone-text
   - rank-bm25, numpy, python-dotenv, spacy, pymupdf
 
 ## Installation
@@ -103,53 +81,8 @@ python app.py
   - Invokes the LangGraph via rag_system.run_graph({question, chat_history, top_k})
   - Returns the generated answer and appends to history
 
-## Programmatic Usage
-
-```python
-from rag_system import RAGSystem, ConversationManager
-
-# Initialize system (loads models, index, and builds LangGraph)
-rag = RAGSystem()
-
-# Single-turn via graph
-answer = rag.run_graph("What is DeepSeek-R1?", top_k=5)
-print(answer)
-
-# Multi-turn via conversation manager
-conv = ConversationManager(rag, top_k=5)
-print(conv.chat("What is DeepSeek-R1?"))
-print(conv.chat("How does it compare to other models?"))
-```
-
-## Tuning
-
-- Retrieval gating thresholds are defined in RAGSystem as class constants:
-  - RERANK_SCORE_THRESHOLD (default 0.20)
-  - COS_SIM_THRESHOLD (default 0.45)
-  - LEX_OVERLAP_MIN (default 1)
-  - CANDIDATE_MULTIPLIER (default 3)
-- Increase thresholds to be more conservative; decrease to recall more.
-- The refinement loop limit is controlled in the evaluate node (iteration_count < 2 by default).
-
-## API Endpoints
-
-- POST /api/chat
-  - Request: { "message": string, "session_id": string (optional) }
-  - Response: { "response": string, "session_id": string }
-
-- POST /api/reset
-  - Request: { "session_id": string }
-  - Response: { "message": string }
-
-- GET /api/health
-  - Response: { "status": "ok", "message": string }
-
 ## Notes
 
 - On first run, the service may need several minutes to build the index and upload vectors to Pinecone.
 - The Agentic LangGraph uses a deterministic judge LLM for scoring and an embedding-based metric for context recall.
 - Multi-turn behavior uses only the most recent 3 turns to keep the prompt compact.
-
-## License
-
-MIT License

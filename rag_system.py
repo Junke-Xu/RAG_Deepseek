@@ -1,15 +1,9 @@
-"""
-RAG system with retrieval, reranking, generation, and LangGraph orchestration.
-"""
-
 import re
 import os
 import numpy as np
 import torch
 from typing import List, Tuple, Optional, TypedDict
 from dotenv import load_dotenv
-
-# LangChain imports
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_groq import ChatGroq
@@ -17,16 +11,10 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 import operator
-
-# Embedding and search
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 from pinecone import Pinecone, ServerlessSpec
-
-# Reranker
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-# NLP
 import spacy
 
 # Load environment variables
@@ -49,9 +37,7 @@ class RAGState(TypedDict, total=False):
 
 
 class RAGSystem:
-    """RAG system."""
 
-    # Retrieval gating thresholds (aligned with notebook)
     RERANK_SCORE_THRESHOLD: float = 0.20
     COS_SIM_THRESHOLD: float = 0.45
     LEX_OVERLAP_MIN: int = 1
@@ -63,7 +49,6 @@ class RAGSystem:
         self.index_name = index_name
         self.semantic_chunks = []
         
-        # Initialize components
         print("Initializing RAG system...")
         self._load_documents()
         self._initialize_embedding_model()
@@ -71,7 +56,7 @@ class RAGSystem:
         self._initialize_bm25()
         self._initialize_reranker()
         self._initialize_llm()
-        # Build LangGraph (retrieve -> generate)
+
         self.graph = self._build_graph()
         print("RAG system initialization complete!")
     
@@ -174,25 +159,17 @@ class RAGSystem:
         print(f"All vectors uploaded successfully, total: {len(vectors)}")
     
     def _initialize_bm25(self):
-        """Init BM25."""
-        print("Initializing BM25...")
         tokenized_corpus = [doc.split() for doc in self.semantic_chunks]
         self.bm25 = BM25Okapi(tokenized_corpus)
-        print("BM25 initialization complete")
     
     def _initialize_reranker(self):
-        """Initialize Reranker model"""
-        print("Loading Reranker model...")
         self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
             "BAAI/bge-reranker-base"
         )
         self.reranker_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
         self.reranker_model.eval()
-        print("Reranker model loaded successfully")
     
     def _initialize_llm(self):
-        """Initialize LLM"""
-        print("Initializing Groq LLM...")
         # Ensure environment variables are reloaded
         load_dotenv(override=True)
         GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -216,7 +193,6 @@ class RAGSystem:
             temperature=0.0,
             max_tokens=512
         )
-        print("Groq LLM initialization complete")
     
     def _build_graph(self):
         """Build Agentic RAG graph."""
@@ -335,11 +311,7 @@ Answer:"""
         final_state = self.graph.invoke(init_state)
         return final_state.get("answer", "")
 
-    # -----------------------------
-    # Evaluation helpers (LLM-judge + embedding similarity)
-    # -----------------------------
     def evaluate_faithfulness(self, answer: str, contexts: List[str]) -> float:
-        """Evaluate whether the answer is grounded in the provided contexts (0-1)."""
         contexts_text = "\n\n".join([f"[Document {i+1}]: {c}" for i, c in enumerate(contexts)])
         prompt = f"""You are an evaluator. Evaluate how faithful the answer is to the context (whether the answer is based on the context without fabrication).
 
