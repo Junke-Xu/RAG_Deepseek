@@ -1,0 +1,35 @@
+# RAG system dependencies
+
+# LangChain related
+langchain>=1.1.0
+langchain-community>=0.4.0
+langchain-groq>=1.1.0
+langgraph>=1.0.0
+langchain-text-splitters>=0.2.0
+
+# Document processing
+pymupdf>=1.23.0
+pypdf>=4.3.0
+sentence-transformers>=5.1.0
+
+# Vector databases
+pinecone-client>=3.2.0
+pinecone-text>=0.11.0
+
+# Search and reranking
+rank-bm25>=0.2.0
+transformers>=4.57.0
+accelerate>=1.12.0
+torch>=2.0.0
+
+# NLP
+spacy>=3.8.0
+
+# Web framework
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+numpy>=1.24.0
+
