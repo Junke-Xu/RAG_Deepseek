@@ -1,655 +1,442 @@
 import re
 import os
+import json
+import time
 import numpy as np
-import torch
-from typing import List, Tuple, Optional, TypedDict
+from typing import List, Tuple, Optional, Dict
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.types import Command
-import operator
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from pinecone import Pinecone, ServerlessSpec
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-import spacy
+import faiss
 
-# Load environment variables
 load_dotenv()
 
+# English stopwords for BM25 filtering
+_STOPWORDS = frozenset(
+    "a an the and or but if in on at to for of is are was were be been being "
+    "has have had do does did will would shall should may might can could "
+    "this that these those it its he she they we you i me him her us them "
+    "my your his her our their what which who whom how when where why "
+    "not no nor so as by with from into about between through during before after".split()
+)
 
-from typing import Sequence, Annotated, Dict
-from langchain_core.messages import BaseMessage
 
-class RAGState(TypedDict, total=False):
-    query: str
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    has_contexts: bool
-    retrieved_contexts: List[str]
-    answer: str
-    evaluation_results: Dict[str, float]
-    needs_refinement: bool
-    iteration_count: int
-    top_k: int
+def _tokenize(text: str) -> List[str]:
+    """Tokenize with stopword removal for BM25."""
+    return [w for w in re.split(r"[^a-z0-9]+", text.lower()) if len(w) >= 2 and w not in _STOPWORDS]
 
 
 class RAGSystem:
 
-    RERANK_SCORE_THRESHOLD: float = 0.20
-    COS_SIM_THRESHOLD: float = 0.45
-    LEX_OVERLAP_MIN: int = 1
-    CANDIDATE_MULTIPLIER: int = 3
-    
-    def __init__(self, pdf_path: str = "Deepseek-r1.pdf", index_name: str = "rag-semantic-index"):
-        """Init."""
+    def __init__(self, pdf_path: str = "Deepseek-r1.pdf"):
         self.pdf_path = pdf_path
-        self.index_name = index_name
-        self.semantic_chunks = []
-        
+        self.chunks: List[str] = []
+
         print("Initializing RAG system...")
         self._load_documents()
         self._initialize_embedding_model()
-        self._initialize_pinecone()
+        self._build_faiss_index()
         self._initialize_bm25()
-        self._initialize_reranker()
         self._initialize_llm()
-
-        self.graph = self._build_graph()
         print("RAG system initialization complete!")
-    
+
     def _load_documents(self):
-        """Load and clean PDF."""
         print("Loading PDF document...")
         loader = PyMuPDFLoader(self.pdf_path)
         docs = loader.load()
-        
-        # Clean text
-        def clean_text(text):
-            text = re.sub(r"-\n", "", text)  # fix hyphen-newlines
-            text = re.sub(r"\n", " ", text)  # flatten newlines
-            text = re.sub(r"\s+", " ", text)
-            return text.strip()
-        
-        cleaned_docs = [clean_text(d.page_content) for d in docs]
-        
-        # Semantic chunking
-        print("Performing document chunking...")
-        nlp = spacy.load("en_core_web_sm")
-        
-        def semantic_chunk(text, max_tokens=120):
-            doc = nlp(text)
-            chunks = []
-            current = []
-            for sent in doc.sents:
-                current.append(sent.text)
-                if len(" ".join(current).split()) > max_tokens:
-                    chunks.append(" ".join(current))
-                    current = []
-            if current:
-                chunks.append(" ".join(current))
-            return chunks
-        
-        for d in cleaned_docs:
-            self.semantic_chunks.extend(semantic_chunk(d))
-        
-        print(f"Document processing complete, total {len(self.semantic_chunks)} semantic chunks")
-    
-    def _initialize_embedding_model(self):
-        """Init embeddings."""
-        print("Loading embedding model...")
-        self.embed_model = SentenceTransformer("BAAI/bge-large-en-v1.5")
-        print(f"Embedding model loaded, dimension: {self.embed_model.get_sentence_embedding_dimension()}")
-    
-    def _initialize_pinecone(self):
-        """Init Pinecone."""
-        print("Connecting to Pinecone...")
-        # Ensure environment variables are reloaded
-        load_dotenv(override=True)
-        PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-        if not PINECONE_API_KEY:
-            env_file_exists = os.path.exists(".env")
-            error_msg = "Please set PINECONE_API_KEY environment variable or configure in .env file"
-            if env_file_exists:
-                error_msg += f"\nHint: .env file exists, but PINECONE_API_KEY not found. Please check .env file format (no spaces around equals sign)"
-            raise ValueError(error_msg)
-        
-        self.pc = Pinecone(api_key=PINECONE_API_KEY)
-        
-        # Check if index exists
-        if self.index_name not in self.pc.list_indexes().names():
-            print(f"Creating index: {self.index_name}")
-            self.pc.create_index(
-                name=self.index_name,
-                dimension=self.embed_model.get_sentence_embedding_dimension(),
-                metric="cosine",
-                spec=ServerlessSpec(
-                    cloud="aws",
-                    region="us-east-1"
-                )
-            )
-            print("Index creation complete, uploading vectors...")
-            self._upload_vectors()
-        else:
-            print(f"Index {self.index_name} already exists")
-        
-        self.index = self.pc.Index(self.index_name)
-    
-    def _upload_vectors(self):
-        """Upload vectors."""
-        vectors = []
-        batch_size = 100
-        
-        for i, text in enumerate(self.semantic_chunks):
-            emb = self.embed_model.encode(text, show_progress_bar=False).tolist()
-            vectors.append({
-                "id": str(i),
-                "values": emb,
-                "metadata": {"text": text[:500]}
-            })
-        
-        # Batch upload
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            self.index.upsert(vectors=batch)
-            print(f"Uploaded {min(i + batch_size, len(vectors))}/{len(vectors)} vectors")
-        
-        print(f"All vectors uploaded successfully, total: {len(vectors)}")
-    
-    def _initialize_bm25(self):
-        tokenized_corpus = [doc.split() for doc in self.semantic_chunks]
-        self.bm25 = BM25Okapi(tokenized_corpus)
-    
-    def _initialize_reranker(self):
-        self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
-            "BAAI/bge-reranker-base"
+
+        full_text = "\n".join(d.page_content for d in docs)
+        full_text = re.sub(r"-\n", "", full_text)
+        full_text = re.sub(r"\n", " ", full_text)
+        full_text = re.sub(r"\s+", " ", full_text).strip()
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=[". ", "? ", "! ", "; ", ", ", " "],
         )
-        self.reranker_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
-        self.reranker_model.eval()
-    
+        self.chunks = splitter.split_text(full_text)
+        print(f"Document processing complete, total {len(self.chunks)} chunks")
+
+    def _initialize_embedding_model(self):
+        print("Loading embedding model...")
+        self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.embed_dim = self.embed_model.get_sentence_embedding_dimension()
+        print(f"Embedding model loaded, dimension: {self.embed_dim}")
+
+    def _build_faiss_index(self):
+        print("Building FAISS index...")
+        embeddings = self.embed_model.encode(self.chunks, show_progress_bar=True, batch_size=64)
+        embeddings = np.array(embeddings, dtype="float32")
+        faiss.normalize_L2(embeddings)
+        self.faiss_index = faiss.IndexFlatIP(self.embed_dim)
+        self.faiss_index.add(embeddings)
+        print(f"FAISS index built with {self.faiss_index.ntotal} vectors")
+
+    def _initialize_bm25(self):
+        tokenized = [_tokenize(doc) for doc in self.chunks]
+        self.bm25 = BM25Okapi(tokenized)
+
     def _initialize_llm(self):
-        # Ensure environment variables are reloaded
         load_dotenv(override=True)
         GROQ_API_KEY = os.getenv("GROQ_API_KEY")
         if not GROQ_API_KEY:
-            # Provide detailed error message
-            env_file_exists = os.path.exists(".env")
-            error_msg = "Please set GROQ_API_KEY environment variable or configure in .env file"
-            if env_file_exists:
-                error_msg += f"\nHint: .env file exists, but GROQ_API_KEY not found. Please check .env file format (no spaces around equals sign)"
-            raise ValueError(error_msg)
-        
+            raise ValueError("Please set GROQ_API_KEY in .env file")
         os.environ["GROQ_API_KEY"] = GROQ_API_KEY
         self.llm = ChatGroq(
             model="llama-3.3-70b-versatile",
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=1000,
         )
-        # Judge LLM for evaluation (deterministic)
-        self.judge_llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            temperature=0.0,
-            max_tokens=512
-        )
-    
-    def _build_graph(self):
-        """Build Agentic RAG graph."""
-        graph = StateGraph(RAGState)
 
-        def retrieve_node(state: RAGState) -> Command[RAGState]:
-            q = state.get("query", "")
-            top_k = state.get("top_k", 5)
-            ctx = self.retrieve(q, top_k=top_k, alpha=0.5)
-            has_ctx = len(ctx) > 0
-            return Command(update={
-                "retrieved_contexts": ctx,
-                "has_contexts": has_ctx,
-                "messages": [HumanMessage(content=f"Retrieved {len(ctx)} documents (filtered)")]
-            })
-
-        def generate_node(state: RAGState) -> Command[RAGState]:
-            ctx = state.get("retrieved_contexts", []) or []
-            q = state.get("query", "")
-            if not ctx:
-                answer = "Sorry, no relevant information found in the knowledge base."
-            else:
-                ctx_text = "\n\n".join([f"[Document {i+1}]: {t}" for i, t in enumerate(ctx)])
-                prompt = f"""Answer the question based on the following context. If the context does not contain relevant information, please state so.
-
-Context:
-{ctx_text}
-
-Question: {q}
-
-Answer:"""
-                r = self.llm.invoke(prompt)
-                answer = r.content if hasattr(r, "content") else str(r)
-            return Command(update={"answer": answer, "messages": [AIMessage(content=answer)]})
-
-        def evaluate_node(state: RAGState) -> Command[RAGState]:
-            q = state.get("query", "")
-            a = state.get("answer", "")
-            ctx = state.get("retrieved_contexts", []) or []
-            if not ctx:
-                results = {"faithfulness": 0.0, "relevance": 0.0, "context_recall": 0.0}
-            else:
-                results = self.evaluate_rag(q, a, ctx)
-            avg = sum(results.values()) / (len(results) or 1)
-            need = (avg < 0.7) and (state.get("iteration_count", 0) < 2)
-            return Command(update={
-                "evaluation_results": results,
-                "needs_refinement": need,
-                "iteration_count": state.get("iteration_count", 0) + 1
-            })
-
-        def refine_node(state: RAGState) -> Command[RAGState]:
-            original_query = state.get("query", "")
-            prompt = f"""The previous answer to the question "{original_query}" had low quality scores.
-Please generate an improved version of this question that might help retrieve more relevant documents.
-Output only the refined question, nothing else."""
-            r = self.llm.invoke(prompt)
-            refined = r.content if hasattr(r, "content") else str(r)
-            return Command(update={"query": refined, "messages": [HumanMessage(content=f"Refining query: {refined}")]})
-
-        def general_node(state: RAGState) -> Command[RAGState]:
-            q = state.get("query", "")
-            prompt = f"""You are a helpful assistant. Answer the following question directly and concisely.
-
-Question: {q}
-
-Answer:"""
-            r = self.llm.invoke(prompt)
-            answer = r.content if hasattr(r, "content") else str(r)
-            return Command(update={"answer": answer, "messages": [AIMessage(content=answer)]})
-
-        graph.add_node("retrieve", retrieve_node)
-        graph.add_node("generate", generate_node)
-        graph.add_node("evaluate", evaluate_node)
-        graph.add_node("refine", refine_node)
-        graph.add_node("general", general_node)
-
-        graph.add_edge(START, "retrieve")
-
-        def after_retrieve(state: RAGState):
-            return "generate" if state.get("has_contexts", False) else "general"
-
-        graph.add_conditional_edges("retrieve", after_retrieve, {
-            "generate": "generate",
-            "general": "general"
-        })
-
-        graph.add_edge("generate", "evaluate")
-
-        def after_eval(state: RAGState):
-            return "refine" if state.get("needs_refinement", False) else END
-
-        graph.add_conditional_edges("evaluate", after_eval, {
-            "refine": "refine",
-            END: END
-        })
-
-        graph.add_edge("refine", "retrieve")
-        graph.add_edge("general", END)
-
-        return graph.compile()
-
-    def run_graph(self, question: str, chat_history: Optional[List[str]] = None, top_k: int = 5) -> str:
-        """Run the Agentic RAG LangGraph and return the answer."""
-        init_state: RAGState = {
-            "query": question,
-            "messages": [HumanMessage(content=question)],
-            "has_contexts": False,
-            "retrieved_contexts": [],
-            "answer": "",
-            "evaluation_results": {},
-            "needs_refinement": False,
-            "iteration_count": 0,
-            "top_k": top_k,
-        }
-        final_state = self.graph.invoke(init_state)
-        return final_state.get("answer", "")
-
-    def evaluate_faithfulness(self, answer: str, contexts: List[str]) -> float:
-        contexts_text = "\n\n".join([f"[Document {i+1}]: {c}" for i, c in enumerate(contexts)])
-        prompt = f"""You are an evaluator. Evaluate how faithful the answer is to the context (whether the answer is based on the context without fabrication).
-
-Context:
-{contexts_text}
-
-Answer:
-{answer}
-
-Output only a number between 0 and 1."""
-        score_text = self.judge_llm.invoke(prompt)
-        text = score_text.content if hasattr(score_text, "content") else str(score_text)
-        m = re.search(r"0?\.\d+|1\.0|0", text)
-        try:
-            return float(m.group()) if m else 0.0
-        except Exception:
-            return 0.0
-
-    def evaluate_relevance(self, question: str, answer: str) -> float:
-        """Evaluate how well the answer responds to the question (0-1)."""
-        prompt = f"""Evaluate how well the answer responds to the question.
-
-Question:
-{question}
-
-Answer:
-{answer}
-
-Output only a number between 0 and 1."""
-        score_text = self.judge_llm.invoke(prompt)
-        text = score_text.content if hasattr(score_text, "content") else str(score_text)
-        m = re.search(r"0?\.\d+|1\.0|0", text)
-        try:
-            return float(m.group()) if m else 0.0
-        except Exception:
-            return 0.0
-
-    def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
-        na, nb = np.linalg.norm(a), np.linalg.norm(b)
-        if na == 0 or nb == 0:
-            return 0.0
-        return float(np.dot(a, b) / (na * nb))
-
-    def evaluate_context_recall(self, question: str, contexts: List[str]) -> float:
-        """Embedding similarity between question and retrieved contexts (max cosine)."""
-        if not contexts:
-            return 0.0
-        q_emb = self.embed_model.encode(question, show_progress_bar=False)
-        ctx_embs = self.embed_model.encode(contexts, show_progress_bar=False)
-        sims = [self._cosine(q_emb, c) for c in ctx_embs]
-        return float(max(sims)) if sims else 0.0
-
-    def evaluate_rag(self, question: str, answer: str, contexts: List[str]) -> Dict[str, float]:
-        """Combine evaluation signals into a dictionary."""
-        return {
-            "faithfulness": self.evaluate_faithfulness(answer, contexts),
-            "relevance": self.evaluate_relevance(question, answer),
-            "context_recall": self.evaluate_context_recall(question, contexts),
-        }
-    
-    def vector_search_pinecone(self, query: str, top_k: int = 10) -> List:
-        """Vector search."""
-        q_emb = self.embed_model.encode(query, show_progress_bar=False).tolist()
-        res = self.index.query(
-            vector=q_emb,
-            top_k=top_k,
-            include_metadata=True
-        )
-        return res.get("matches", [])
-    
-    def hybrid_search(self, query: str, alpha: float = 0.5, top_k: int = 10) -> List[Tuple[int, float, str]]:
-        """Hybrid search (BM25 + vector)."""
-        # BM25 scores
-        query_tokens = query.split()
-        if not query_tokens:
-            return []
-        
-        bm25_scores = self.bm25.get_scores(query_tokens)
-        
-        # Normalize BM25 scores
-        if np.max(bm25_scores) - np.min(bm25_scores) > 1e-9:
-            bm25_norm = (bm25_scores - np.min(bm25_scores)) / (np.max(bm25_scores) - np.min(bm25_scores))
-        else:
-            bm25_norm = np.ones_like(bm25_scores) * 0.5
-        
-        # Pinecone vector search
-        vector_results = self.vector_search_pinecone(query, top_k=top_k * 2)
-        
-        vector_scores = np.zeros(len(self.semantic_chunks))
-        for m in vector_results:
-            idx = int(m["id"])
-            if 0 <= idx < len(self.semantic_chunks):
-                vector_scores[idx] = m.get("score", 0.0)
-        
-        # Normalize vector scores
-        if np.max(vector_scores) - np.min(vector_scores) > 1e-9:
-            vector_norm = (vector_scores - np.min(vector_scores)) / (np.max(vector_scores) - np.min(vector_scores))
-        else:
-            vector_norm = np.ones_like(vector_scores) * 0.5
-        
-        # Hybrid scores
-        hybrid = alpha * bm25_norm + (1 - alpha) * vector_norm
-        
-        # Top K results
-        best_idx = np.argsort(hybrid)[::-1][:top_k]
-        
-        return [(i, float(hybrid[i]), self.semantic_chunks[i]) for i in best_idx]
-    
-    def rerank(self, query: str, candidates: List[Tuple], top_k: int = 5) -> List[Tuple]:
-        """Rerank candidates."""
-        if not candidates:
-            return []
-        
-        pairs = [[query, c[2]] for c in candidates]
-        inputs = self.reranker_tokenizer(
-            pairs,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        )
-        
-        with torch.no_grad():
-            scores = self.reranker_model(**inputs).logits.squeeze()
-        
-        # Handle single result case
-        if scores.dim() == 0:
-            scores = scores.unsqueeze(0)
-        
-        scored = list(zip(scores.tolist(), candidates))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        
-        return scored[:top_k]
-    
-    def _tok(self, s: str) -> List[str]:
-        """Lightweight tokenizer with simple English stopword filtering."""
-        _STOP = set(("the a an and or of to is are was were be been being for with on at from by in into than as that this these those it its".split()))
-        return [t for t in re.split(r"[^A-Za-z0-9]+", s.lower()) if len(t) >= 2 and t not in _STOP]
-
-    def retrieve(self, query: str, top_k: int = 5, alpha: float = 0.5) -> List[str]:
+    # ----------------------------------------------------------------
+    # Semantic Interceptor: classify + rewrite or clarify
+    # ----------------------------------------------------------------
+    def analyze_query(self, query: str, chat_history: Optional[List[str]] = None) -> Dict:
         """
-        Retrieve relevant documents with candidate expansion and gating, aligned with the notebook.
-        
-        Steps:
-        1) Expand candidate pool via hybrid search
-        2) Cross-encoder rerank
-        3) Compute semantic similarity and lexical overlap
-        4) Apply gating thresholds and truncate
-        """
-        # 1) Expand candidate pool
-        pool_k = max(top_k * self.CANDIDATE_MULTIPLIER, 15)
-        hybrid_results = self.hybrid_search(query, alpha=alpha, top_k=pool_k) or []
-        if not hybrid_results:
-            return []
-
-        # 2) Cross-encoder rerank (keep larger pool)
-        reranked_raw = self.rerank(query, hybrid_results, top_k=pool_k) or []
-
-        # Unpack reranked results into texts and a score map
-        reranked_texts: List[str] = []
-        score_map = {}
-        for item in reranked_raw:
-            # item expected shape: (score, (idx, hybrid_score, text))
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                score, payload = item
-                try:
-                    score = float(score)
-                except Exception:
-                    continue
-                text = None
-                if isinstance(payload, (list, tuple)):
-                    if len(payload) >= 3 and isinstance(payload[2], str):
-                        text = payload[2]
-                    elif isinstance(payload[-1], str):
-                        text = payload[-1]
-                elif isinstance(payload, dict):
-                    md = payload.get("metadata") or {}
-                    t = md.get("text")
-                    if isinstance(t, str):
-                        text = t
-                elif isinstance(payload, str):
-                    text = payload
-                if isinstance(text, str):
-                    reranked_texts.append(text)
-                    score_map[text] = score
-            elif isinstance(item, str):
-                reranked_texts.append(item)
-
-        texts_for_sim = reranked_texts if reranked_texts else [x[2] for x in hybrid_results if isinstance(x, (list, tuple)) and len(x) >= 3 and isinstance(x[2], str)]
-        if not texts_for_sim:
-            return []
-
-        # 3) Compute semantic similarity
-        try:
-            q_emb = self.embed_model.encode(query, show_progress_bar=False)
-            t_embs = self.embed_model.encode(texts_for_sim, show_progress_bar=False)
-            sims = [float(np.dot(q_emb, te) / (np.linalg.norm(q_emb) * np.linalg.norm(te)) if (np.linalg.norm(q_emb) != 0 and np.linalg.norm(te) != 0) else 0.0) for te in t_embs]
-        except Exception:
-            sims = [0.0] * len(texts_for_sim)
-
-        # 4) Compute lexical overlap
-        q_toks = set(self._tok(query))
-        overlaps = []
-        for t in texts_for_sim:
-            dtoks = set(self._tok(t))
-            overlaps.append(len(q_toks & dtoks))
-
-        # 5) Apply gating filters
-        gated = []
-        for i, t in enumerate(texts_for_sim):
-            rerank_score = score_map.get(t, -1e9)
-            cos_score = sims[i]
-            overlap_cnt = overlaps[i]
-            if (
-                rerank_score >= self.RERANK_SCORE_THRESHOLD
-                and cos_score >= self.COS_SIM_THRESHOLD
-                and overlap_cnt >= self.LEX_OVERLAP_MIN
-            ):
-                gated.append((rerank_score, t, cos_score, overlap_cnt))
-
-        # 6) Sort & truncate by cross-encoder score
-        gated.sort(key=lambda x: x[0], reverse=True)
-        final_texts = [t for (_, t, __, ___) in gated[:top_k]]
-        return final_texts
-    
-    def rag_answer(self, query: str, top_k: int = 5, context: Optional[List[str]] = None) -> str:
-        """
-        Generate answer using RAG
-        
-        Args:
-            query: Query text
-            top_k: Number of documents to retrieve
-            context: Optional list of recent conversation turns as strings
-        
+        Classify user query as clear or ambiguous.
         Returns:
-            str: Generated answer
+            {"action": "search", "refined_query": "...", "confirmation": "..."}
+            or
+            {"action": "clarify", "question": "..."}
         """
-        # Retrieve relevant documents
-        ctx = self.retrieve(query, top_k=top_k)
-        
-        # Build prompt
-        context_text = "\n\n".join([f"[Document {i+1}]: {text}" for i, text in enumerate(ctx)]) if ctx else ""
+        history_block = ""
+        if chat_history:
+            history_block = "Conversation history:\n" + "\n".join(chat_history[-3:]) + "\n\n"
+
+        prompt = f"""{history_block}You are a query analysis assistant for a knowledge base about DeepSeek (the AI model/company).
+
+Analyze the following user query and decide:
+1. Is it IRRELEVANT? (completely unrelated to DeepSeek, AI models, machine learning, or the knowledge base — e.g., weather, sports, cooking, personal questions)
+2. Is it CLEAR enough to search? (specific entities, model names, concrete concepts related to DeepSeek)
+3. Is it AMBIGUOUS? (vague pronouns like "it/this/that", unclear references, missing key details)
+
+If the conversation history can resolve the ambiguity (e.g., a pronoun refers to something mentioned earlier), treat it as CLEAR.
+
+Respond in JSON format ONLY, no other text:
+
+If IRRELEVANT:
+{{"action": "irrelevant"}}
+
+If CLEAR:
+{{"action": "search", "refined_query": "<rewritten query optimized for technical/academic search>", "confirmation": "<brief confirmation of what you understood, as a question>"}}
+
+If AMBIGUOUS:
+{{"action": "clarify", "question": "<specific clarification question to ask the user>"}}
+
+User query: {query}"""
+
+        response = self.llm.invoke(prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+        return self._parse_interceptor_json(text, query)
+
+    def _parse_interceptor_json(self, text: str, fallback_query: str) -> Dict:
+        """Parse JSON from LLM response with robust fallback."""
+        # Try parsing the full text first
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            pass
+
+        # Try to find JSON block with balanced braces
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        start = -1
+
+        return {"action": "search", "refined_query": fallback_query, "confirmation": ""}
+
+    def classify_reply(self, clarification_question: str, user_reply: str,
+                       original_query: str,
+                       chat_history: Optional[List[str]] = None) -> Dict:
+        """
+        Classify user's reply to a clarification question.
+        Returns:
+            {"type": "direct_answer"}  — user answered the clarification (e.g. "DeepSeek-R1")
+            {"type": "counter_question"}  — user asks a related sub-question (e.g. "what models do you have?")
+            {"type": "new_topic"}  — user changed the topic entirely
+        """
+        history_block = ""
+        if chat_history:
+            history_block = "Conversation history:\n" + "\n".join(chat_history[-3:]) + "\n\n"
+
+        prompt = f"""{history_block}The system asked a clarification question and the user replied.
+Classify the user's reply into one of three categories:
+
+1. "direct_answer" — The user answered the clarification (e.g. gave a specific name, choice, or detail).
+2. "counter_question" — The user asked a related follow-up or sub-question instead of answering directly (e.g. "what options do I have?", "what models are there?").
+3. "new_topic" — The user completely changed the topic and is asking something unrelated.
+
+Original user question: {original_query}
+System's clarification: {clarification_question}
+User's reply: {user_reply}
+
+Respond in JSON format ONLY:
+{{"type": "<direct_answer|counter_question|new_topic>"}}"""
+
+        response = self.llm.invoke(prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+        result = self._parse_interceptor_json(text, "")
+        if result.get("type") not in ("direct_answer", "counter_question", "new_topic"):
+            return {"type": "direct_answer"}
+        return result
+
+    def merge_query(self, original_query: str, clarification_answer: str,
+                    chat_history: Optional[List[str]] = None) -> str:
+        """
+        Merge original ambiguous query + user's clarification into a refined query.
+        """
+        history_block = ""
+        if chat_history:
+            history_block = "Conversation history:\n" + "\n".join(chat_history[-3:]) + "\n\n"
+
+        prompt = f"""{history_block}Combine the original question and the user's clarification into one clear, search-optimized query.
+
+Original question: {original_query}
+User's clarification: {clarification_answer}
+
+Output ONLY the refined query, nothing else."""
+
+        response = self.llm.invoke(prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+        return text.strip()
+
+    # ----------------------------------------------------------------
+    # Search & Answer
+    # ----------------------------------------------------------------
+    def vector_search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
+        q_emb = self.embed_model.encode([query], show_progress_bar=False).astype("float32")
+        faiss.normalize_L2(q_emb)
+        scores, indices = self.faiss_index.search(q_emb, top_k)
+        return [(int(idx), float(score)) for idx, score in zip(indices[0], scores[0]) if idx >= 0]
+
+    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5) -> List[str]:
+        bm25_scores = self.bm25.get_scores(_tokenize(query))
+        bm25_range = np.max(bm25_scores) - np.min(bm25_scores)
+        if bm25_range > 1e-9:
+            bm25_norm = (bm25_scores - np.min(bm25_scores)) / bm25_range
+        else:
+            bm25_norm = np.zeros_like(bm25_scores)
+
+        vec_results = self.vector_search(query, top_k=top_k * 2)
+        vec_scores = np.zeros(len(self.chunks))
+        for idx, score in vec_results:
+            vec_scores[idx] = score
+
+        hybrid = alpha * bm25_norm + (1 - alpha) * vec_scores
+        best_idx = np.argsort(hybrid)[::-1][:top_k]
+        return [self.chunks[i] for i in best_idx if hybrid[i] > 0.01]
+
+    def answer(self, query: str, chat_history: Optional[List[str]] = None, top_k: int = 5) -> str:
+        contexts = self.hybrid_search(query, top_k=top_k)
+
+        if not contexts:
+            return "Sorry, no relevant information found in the knowledge base."
+
+        ctx_text = "\n\n".join(f"[Document {i+1}]: {t}" for i, t in enumerate(contexts))
         history_text = ""
-        if context:
-            history_text = "\n\nConversation history (most recent first):\n" + "\n".join(context[-3:])
-        
-        prompt = f"""Answer the question using only the information from the provided context and conversation history. If the context does not contain relevant information, say that you do not know.
+        if chat_history:
+            history_text = "\n\nConversation history:\n" + "\n".join(chat_history[-3:])
+
+        prompt = f"""Answer the question based on the following context. If the context does not contain relevant information, say so.
 
 Context:
-{context_text}{history_text}
+{ctx_text}{history_text}
 
 Question: {query}
 
 Answer:"""
-        
-        # Call LLM
+
         response = self.llm.invoke(prompt)
-        
-        # Extract text content
-        if hasattr(response, 'content'):
-            return response.content
-        else:
-            return str(response)
+        return response.content if hasattr(response, "content") else str(response)
 
 
 class ConversationManager:
-    """Multi-turn conversation manager"""
-    
-    def __init__(self, rag_system: RAGSystem, top_k: int = 5, alpha: float = 0.5):
-        """
-        Initialize conversation manager
-        
-        Args:
-            rag_system: RAG system instance
-            top_k: Number of documents to retrieve
-            alpha: BM25 weight
-        """
+
+    MAX_CLARIFICATIONS = 2  # Max consecutive clarification rounds
+
+    def __init__(self, rag_system: RAGSystem):
         self.rag_system = rag_system
-        self.top_k = top_k
-        self.alpha = alpha
-        self.history = []  # [(user, assistant), ...]
-    
-    def chat(self, user_input: str) -> str:
+        self.history: List[Tuple[str, str]] = []
+        self._pending_query: Optional[str] = None
+        self._pending_clarification: Optional[str] = None
+        self._pending_refined_query: Optional[str] = None   # Awaiting user confirmation
+        self._pending_confirmation_text: Optional[str] = None
+        self._clarification_count: int = 0
+
+    def _do_search(self, refined_query: str, recent: List[str]) -> Dict:
+        """Execute RAG search and return answer dict."""
+        answer = self.rag_system.answer(refined_query, chat_history=recent)
+        self.history.append((refined_query, answer))
+        return {"type": "answer", "response": answer}
+
+    def _send_confirmation(self, refined_query: str, confirmation: str) -> Dict:
+        """Send confirmation to user and wait for yes/no."""
+        self._pending_refined_query = refined_query
+        self._pending_confirmation_text = confirmation
+        self.history.append(("", confirmation))
+        return {"type": "confirmation", "response": confirmation}
+
+    def _classify_confirmation_reply(self, user_input: str) -> str:
+        """Check if user confirmed (yes) or rejected (no/correction)."""
+        prompt = f"""The system asked the user to confirm their search intent:
+"{self._pending_confirmation_text}"
+
+The user replied: "{user_input}"
+
+Is the user confirming (agreeing, saying yes, ok, correct, sure, etc.) or rejecting/correcting?
+
+Respond in JSON format ONLY:
+{{"confirmed": true}} or {{"confirmed": false}}"""
+
+        response = self.rag_system.llm.invoke(prompt)
+        text = response.content if hasattr(response, "content") else str(response)
+        result = self.rag_system._parse_interceptor_json(text, "")
+        return result.get("confirmed", True)
+
+    def chat(self, user_input: str) -> Dict:
         """
-        Process user input and generate response
-        
-        Args:
-            user_input: User input
-        
         Returns:
-            str: Assistant response
+            {"type": "clarification", "response": "..."}
+            {"type": "confirmation", "response": "..."}
+            {"type": "answer", "response": "..."}
         """
-        # Build recent conversation context (last 3 turns)
-        recent_context = [f"User: {u}\nAssistant: {a}" for u, a in self.history[-3:]]
+        recent = [f"User: {u}\nAssistant: {a}" for u, a in self.history[-3:]]
 
-        # Invoke LangGraph (retrieve -> generate)
-        answer = self.rag_system.run_graph(
-            question=user_input,
-            chat_history=recent_context,
-            top_k=self.top_k,
-        )
-        
-        # Save to history
-        self.history.append((user_input, answer))
-        
-        return answer
-    
+        # ── State A: Awaiting confirmation (yes/no) ──
+        if self._pending_refined_query is not None:
+            confirmed = self._classify_confirmation_reply(user_input)
+            refined = self._pending_refined_query
+            self._pending_refined_query = None
+            self._pending_confirmation_text = None
+
+            if confirmed:
+                return self._do_search(refined, recent)
+            else:
+                # User rejected — treat their reply as a fresh question
+                self._clarification_count = 0
+                analysis = self.rag_system.analyze_query(user_input, chat_history=recent)
+                return self._handle_analysis(analysis, user_input, recent)
+
+        # ── State B: Awaiting clarification reply ──
+        if self._pending_query is not None:
+            reply_type = self.rag_system.classify_reply(
+                clarification_question=self._pending_clarification or "",
+                user_reply=user_input,
+                original_query=self._pending_query,
+                chat_history=recent,
+            ).get("type", "direct_answer")
+
+            if reply_type == "new_topic":
+                self._clear_pending()
+                analysis = self.rag_system.analyze_query(user_input, chat_history=recent)
+                return self._handle_analysis(analysis, user_input, recent)
+
+            elif reply_type == "counter_question":
+                sub_answer = self.rag_system.answer(user_input, chat_history=recent)
+                self.history.append((user_input, sub_answer))
+                re_ask = f"{sub_answer}\n\nComing back to your original question: {self._pending_clarification}"
+                return {"type": "clarification", "response": re_ask}
+
+            else:
+                # direct_answer — merge into refined query
+                refined = self.rag_system.merge_query(
+                    self._pending_query, user_input, chat_history=recent
+                )
+                self._clear_pending()
+
+                if self._clarification_count >= self.MAX_CLARIFICATIONS:
+                    self._clarification_count = 0
+                    analysis = {"action": "search", "refined_query": refined, "confirmation": ""}
+                else:
+                    analysis = self.rag_system.analyze_query(refined, chat_history=recent)
+                return self._handle_analysis(analysis, user_input, recent)
+
+        # ── State C: Fresh question ──
+        self._clarification_count = 0
+        analysis = self.rag_system.analyze_query(user_input, chat_history=recent)
+        return self._handle_analysis(analysis, user_input, recent)
+
+    def _handle_analysis(self, analysis: Dict, user_input: str, recent: List[str]) -> Dict:
+        """Handle the result of analyze_query: irrelevant, clarify, confirm, or search."""
+        # Irrelevant → reject directly
+        if analysis.get("action") == "irrelevant":
+            msg = "Sorry, your question is not related to the knowledge base. This system can only answer questions about DeepSeek."
+            self.history.append((user_input, msg))
+            return {"type": "answer", "response": msg}
+
+        # Ambiguous → ask clarification
+        if analysis.get("action") == "clarify":
+            clarify_question = analysis.get("question", "Could you please provide more details?")
+            self._pending_query = user_input
+            self._pending_clarification = clarify_question
+            self._clarification_count += 1
+            self.history.append((user_input, clarify_question))
+            return {"type": "clarification", "response": clarify_question}
+
+        # Clear → send confirmation before searching
+        self._clarification_count = 0
+        refined_query = analysis.get("refined_query", user_input)
+        confirmation = analysis.get("confirmation", "")
+
+        if confirmation:
+            return self._send_confirmation(refined_query, confirmation)
+        else:
+            # No confirmation text generated, search directly
+            return self._do_search(refined_query, recent)
+
+    def _clear_pending(self):
+        self._pending_query = None
+        self._pending_clarification = None
+
     def reset(self):
-        """Reset conversation history"""
         self.history = []
-    
-    def get_history(self) -> List[Tuple[str, str]]:
-        """Get conversation history"""
-        return self.history
-    
-    def display_history(self):
-        """Display conversation history"""
-        if not self.history:
-            print("No conversation history")
-            return
-        
-        print("\n" + "="*60)
-        print("Conversation History")
-        print("="*60)
-        for i, (user, assistant) in enumerate(self.history, 1):
-            print(f"\n[Turn {i}]")
-            print(f"User: {user}")
-            print(f"Assistant: {assistant}")
-        print("="*60 + "\n")
+        self._pending_query = None
+        self._pending_clarification = None
+        self._pending_refined_query = None
+        self._pending_confirmation_text = None
+        self._clarification_count = 0
 
 
-# Global RAG system instance (for Flask application)
+# ----------------------------------------------------------------
+# Session management with TTL cleanup
+# ----------------------------------------------------------------
 _rag_system = None
-_conversation_managers = {}  # session_id -> ConversationManager
+
+SESSION_TTL = 3600  # 1 hour
+MAX_SESSIONS = 100
+
+_conversation_managers: Dict[str, Tuple["ConversationManager", float]] = {}
+
+
+def _cleanup_sessions():
+    """Remove expired sessions."""
+    now = time.time()
+    expired = [sid for sid, (_, ts) in _conversation_managers.items() if now - ts > SESSION_TTL]
+    for sid in expired:
+        del _conversation_managers[sid]
+
+    # If still over limit, remove oldest
+    if len(_conversation_managers) > MAX_SESSIONS:
+        sorted_sessions = sorted(_conversation_managers.items(), key=lambda x: x[1][1])
+        for sid, _ in sorted_sessions[:len(_conversation_managers) - MAX_SESSIONS]:
+            del _conversation_managers[sid]
 
 
 def get_rag_system() -> RAGSystem:
-    """Get global RAG system instance (singleton pattern)"""
     global _rag_system
     if _rag_system is None:
         _rag_system = RAGSystem()
@@ -657,7 +444,11 @@ def get_rag_system() -> RAGSystem:
 
 
 def get_conversation_manager(session_id: str) -> ConversationManager:
-    """Get or create conversation manager"""
-    if session_id not in _conversation_managers:
-        _conversation_managers[session_id] = ConversationManager(get_rag_system())
-    return _conversation_managers[session_id]
+    _cleanup_sessions()
+    if session_id in _conversation_managers:
+        mgr, _ = _conversation_managers[session_id]
+        _conversation_managers[session_id] = (mgr, time.time())
+        return mgr
+    mgr = ConversationManager(get_rag_system())
+    _conversation_managers[session_id] = (mgr, time.time())
+    return mgr

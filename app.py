@@ -21,26 +21,23 @@ def chat():
     try:
         data = request.get_json()
         message = data.get('message', '').strip()
-        
+
         if not message:
             return jsonify({'error': 'Message cannot be empty'}), 400
-        
-        # Get or create session ID
+
         session_id = data.get('session_id')
         if not session_id:
             session_id = str(uuid.uuid4())
-        
-        # Get conversation manager
+
         conv_manager = get_conversation_manager(session_id)
-        
-        # Generate response
-        response = conv_manager.chat(message)
-        
+        result = conv_manager.chat(message)
+
         return jsonify({
-            'response': response,
+            'response': result['response'],
+            'type': result['type'],  # "clarification" or "answer"
             'session_id': session_id
         })
-    
+
     except Exception as e:
         print(f"Error: {str(e)}")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
@@ -52,18 +49,17 @@ def reset():
     try:
         data = request.get_json()
         session_id = data.get('session_id')
-        
+
         if not session_id:
             return jsonify({'error': 'session_id is required'}), 400
-        
-        # Get conversation manager and reset
+
         try:
             conv_manager = get_conversation_manager(session_id)
             conv_manager.reset()
             return jsonify({'message': 'Conversation history reset'})
-        except:
+        except Exception:
             return jsonify({'message': 'Session does not exist or has been reset'})
-    
+
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
@@ -75,13 +71,10 @@ def health():
 
 
 if __name__ == '__main__':
-    # Preload RAG system
     print("Preloading RAG system (this may take some time)...")
     get_rag_system()
     print("RAG system preload complete")
-    
-    # Start Flask application
-    print("\nStarting Flask server...")
-    print("Visit http://localhost:5000 to use the chat interface")
-    app.run(debug=True, host='0.0.0.0', port=5000)
 
+    print("\nStarting Flask server...")
+    print("Visit http://localhost:5001 to use the chat interface")
+    app.run(debug=False, host='0.0.0.0', port=5001)

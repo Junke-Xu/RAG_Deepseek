@@ -116,6 +116,30 @@
             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         }
 
+        .message.assistant.clarification .message-bubble {
+            background: #fff8e1;
+            border: 1px solid #ffe082;
+            color: #5d4037;
+        }
+
+        .message.assistant.clarification .message-bubble::before {
+            content: "Clarification needed: ";
+            font-weight: 600;
+            color: #f57f17;
+        }
+
+        .message.assistant.confirmation .message-bubble {
+            background: #e8f5e9;
+            border: 1px solid #a5d6a7;
+            color: #1b5e20;
+        }
+
+        .message.assistant.confirmation .message-bubble::before {
+            content: "Please confirm: ";
+            font-weight: 600;
+            color: #2e7d32;
+        }
+
         .input-container {
             padding: 20px;
             background: white;
@@ -311,8 +335,15 @@
                     // Remove loading animation
                     removeLoadingMessage(loadingId);
                     
-                    // Show assistant response
-                    addMessage('assistant', data.response);
+                    // Show assistant response with type styling
+                    addMessage('assistant', data.response, data.type);
+
+                    // If confirmation, show hint
+                    if (data.type === 'confirmation') {
+                        document.getElementById('messageInput').placeholder = 'Reply yes to confirm, or type a correction...';
+                    } else {
+                        document.getElementById('messageInput').placeholder = 'Enter your question...';
+                    }
                 } else {
                     removeLoadingMessage(loadingId);
                     addMessage('assistant', 'Error: ' + (data.error || 'Unknown error'));
@@ -328,11 +359,14 @@
         }
 
         // Add message to chat container
-        function addMessage(type, text) {
+        function addMessage(type, text, responseType) {
             const container = document.getElementById('chatContainer');
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${type}`;
-            
+            if (type === 'assistant' && (responseType === 'clarification' || responseType === 'confirmation')) {
+                messageDiv.className += ' ' + responseType;
+            }
+
             const bubble = document.createElement('div');
             bubble.className = 'message-bubble';
             bubble.textContent = text;
